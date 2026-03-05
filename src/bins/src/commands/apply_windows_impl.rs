@@ -1,13 +1,12 @@
 use crate::{
     dialogs,
     shared::{self},
-    // windows::locksmith,
-    windows::splash,
+    windows::{self, splash},
 };
 use anyhow::{bail, Context, Result};
-use std::sync::mpsc;
-use std::{fs, path::PathBuf};
-use velopack::{bundle::load_bundle_from_file, constants, locator::VelopackLocator};
+use std::{ffi::OsString, fs, path::PathBuf};
+use std::{sync::mpsc, time::Duration};
+use velopack::{bundle::load_bundle_from_file, constants, locator::VelopackLocator, process};
 
 // fn ropycopy<P1: AsRef<Path>, P2: AsRef<Path>>(source: &P1, dest: &P2) -> Result<()> {
 //     let source = source.as_ref();
@@ -39,18 +38,85 @@ use velopack::{bundle::load_bundle_from_file, constants, locator::VelopackLocato
 //     Ok(())
 // }
 
-pub fn apply_package_impl(old_locator: &VelopackLocator, package: &PathBuf, run_hooks: bool) -> Result<VelopackLocator> {
-    let mut bundle = load_bundle_from_file(package)?;
-    let new_app_manifest = bundle.read_manifest()?;
+pub fn apply_package_impl(old_locator: &VelopackLocator, package: &PathBuf, hook_mode: super::HookRunMode) -> Result<VelopackLocator> {
+    let root_path = old_locator.get_root_dir();
+
+    let mut bundle = load_bundle_from_file(package).map_err(|e| {
+        warn!("Deleting package {:?} to prevent update loop: {}", package, e);
+        let _ = fs::remove_file(package);
+        e
+    })?;
+    let new_app_manifest = bundle.read_manifest().map_err(|e| {
+        warn!("Deleting package {:?} to prevent update loop: {}", package, e);
+        let _ = fs::remove_file(package);
+        e
+    })?;
     let new_locator = old_locator.clone_self_with_new_manifest(&new_app_manifest);
 
-    let root_path = old_locator.get_root_dir();
+    if !windows::is_directory_writable(&root_path) {
+        if process::is_current_process_elevated() {
+            bail!("The root directory is not writable & process is already admin. The update cannot continue.");
+        } else {
+            info!("Re-launching as administrator to update in {:?}", root_path);
+
+            let packages_dir = old_locator.get_packages_dir();
+            let args: Vec<OsString> = vec![
+                "apply".into(),
+                "--norestart".into(),
+                "--package".into(),
+                package.into(),
+                "--rootDir".into(),
+                root_path.into(),
+                "--packageDir".into(),
+                packages_dir.into(),
+            ];
+            let exe_path = std::env::current_exe()?;
+            let work_dir: Option<String> = None; // same as this process
+                                                 // NB: show_window must be true for dialogs to be shown
+                                                 // https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-taskdialogindirect#remarks
+            let process_handle = process::run_process_as_admin(&exe_path, args, work_dir, true)?;
+
+            info!(
+                "Waiting (up to 10 minutes) for elevated process (pid: {}) to exit...",
+                process_handle.pid()
+            );
+            let result = process::wait_for_process_to_exit(process_handle, Some(Duration::from_secs(10 * 60)))?;
+
+            match result {
+                process::WaitResult::WaitTimeout => {
+                    bail!("Elevated process has not exited within 10 minutes. (TIMEOUT)");
+                }
+                process::WaitResult::ExitCode(code) => {
+                    if code != 0 {
+                        bail!("Elevated process has exited with ERROR: {}.", code);
+                    } else {
+                        info!("Elevated process has run successfully.");
+                    }
+                }
+                process::WaitResult::NoWaitRequired => {
+                    info!("Elevated process has not required waiting.");
+                }
+            }
+            return Ok(new_locator);
+        }
+    }
+
+    // Acquire exclusive lock AFTER the self-elevation check. If we acquired it before,
+    // the non-elevated parent would hold the lock while waiting for the elevated child,
+    // which would also try to acquire the lock — causing a deadlock.
+    let _mutex = old_locator.try_get_exclusive_lock()?;
+
     let old_version = old_locator.get_manifest_version();
     let new_version = new_locator.get_manifest_version();
 
     info!("Applying package {} to current: {}", new_version, old_version);
 
-    if !crate::windows::prerequisite::prompt_and_install_all_missing(&new_app_manifest, Some(&old_version))? {
+    if !crate::windows::prerequisite::prompt_and_install_all_missing(
+        &new_app_manifest.title,
+        &new_version.to_string(),
+        &new_app_manifest.runtime_dependencies,
+        Some(&old_version),
+    )? {
         bail!("Stopping apply. Pre-requisites are missing and user cancelled.");
     }
 
@@ -69,27 +135,33 @@ pub fn apply_package_impl(old_locator: &VelopackLocator, package: &PathBuf, run_
     let action: Result<()> = (|| {
         // first, extract the update to temp_path_new
         fs::create_dir_all(&temp_path_new)?;
-        bundle.extract_lib_contents_to_path(&temp_path_new, |p| {
-            let _ = tx.send(p);
-        })?;
+        bundle
+            .extract_lib_contents_to_path(&temp_path_new, |p| {
+                let _ = tx.send(p);
+            })
+            .map_err(|e| {
+                warn!("Deleting package {:?} to prevent update loop: {}", package, e);
+                let _ = fs::remove_file(package);
+                e
+            })?;
 
         let _ = tx.send(splash::MSG_INDEFINITE);
 
         // second, run application hooks (but don't care if it fails)
-        if run_hooks {
+        if hook_mode == super::HookRunMode::All {
             crate::windows::run_hook(old_locator, constants::HOOK_CLI_OBSOLETE, 15);
         } else {
             info!("Skipping --veloapp-obsolete hook.");
         }
 
         // third, we try _REALLY HARD_ to stop the package
-        let _ = shared::force_stop_package(root_path);
+        let _ = shared::force_stop_package(&root_path);
         // if winsafe::IsWindows10OrGreater() == Ok(true) && !locksmith::close_processes_locking_dir(&old_locator) {
         //     bail!("Failed to close processes locking directory / user cancelled.");
         // }
 
         // fourth, we make as backup of the current dir to temp_path_old
-        info!("Backing up current dir to {}", &temp_path_old.to_string_lossy());
+        info!("Backing up current dir to {:?}", &temp_path_old);
         shared::retry_io_ex(|| fs::rename(&current_dir, &temp_path_old), 1000, 10)
             .context("Unable to start the update, because one or more running processes prevented it. Try again later, or if the issue persists, restart your computer.")?;
 
@@ -102,9 +174,10 @@ pub fn apply_package_impl(old_locator: &VelopackLocator, package: &PathBuf, run_
 
         // fifth, we try to replace the current dir with temp_path_new
         // if this fails we will yolo a rollback...
-        info!("Replacing current dir with {}", &temp_path_new.to_string_lossy());
-        shared::retry_io_ex(|| fs::rename(&temp_path_new, &current_dir), 1000, 30)
-            .context("Unable to complete the update, and the app was left in a broken state. You may need to re-install or repair this application manually.")?;
+        info!("Replacing current dir with {:?}", &temp_path_new);
+        shared::retry_io_ex(|| fs::rename(&temp_path_new, &current_dir), 1000, 30).context(
+            "Unable to complete the update, and the app was left in a broken state. You may need to re-install or repair this application manually.",
+        )?;
 
         // if !requires_robocopy {
         //     // if we didn't need robocopy for the backup, we don't need it for the deploy hopefully
@@ -137,21 +210,15 @@ pub fn apply_package_impl(old_locator: &VelopackLocator, package: &PathBuf, run_
         // from this point on, we're past the point of no return and should not bail
         // sixth, we write the uninstall entry
         if !old_locator.get_is_portable() {
-            if old_locator.get_manifest_id() != new_locator.get_manifest_id() {
-                info!("The app ID has changed, removing old uninstall registry entry.");
-                if let Err(e) = crate::windows::registry::remove_uninstall_entry(&old_locator) {
-                    warn!("Failed to remove old uninstall entry ({}).", e);
-                }
-            }
-            if let Err(e) = crate::windows::registry::write_uninstall_entry(&new_locator) {
-                warn!("Failed to write new uninstall entry ({}).", e);
+            if let Err(e) = crate::windows::registry::update_uninstall_entry(&old_locator, &new_locator) {
+                warn!("Failed to update uninstall entry ({}).", e);
             }
         } else {
             info!("Skipping uninstall entry for portable app.");
         }
 
         // seventh, we run the post-install hooks
-        if run_hooks {
+        if hook_mode == super::HookRunMode::All || hook_mode == super::HookRunMode::PostOnly {
             crate::windows::run_hook(&new_locator, constants::HOOK_CLI_UPDATED, 15);
         } else {
             info!("Skipping --veloapp-updated hook.");
@@ -170,6 +237,41 @@ pub fn apply_package_impl(old_locator: &VelopackLocator, package: &PathBuf, run_
 
         // done!
         info!("Package applied successfully.");
+
+        // Sync Update.exe to root directory if we're running from a different location
+        let default_update_exe = &root_path.join("Update.exe");
+        let current_update_exe = std::env::current_exe()?;
+
+        if (current_update_exe.exists()) == false {
+            warn!("Current Update.exe path does not exist, skipping default path sync (this shouldn't happen)");
+            return Ok(());
+        }
+
+        match (
+            default_update_exe.exists(),
+            same_file::is_same_file(&default_update_exe, &current_update_exe),
+        ) {
+            (true, Ok(true)) => {
+                info!("Update.exe is already in the correct location: {:?}", &current_update_exe);
+            }
+            (false, _) | (_, Ok(false)) => {
+                info!(
+                    "Running from non-default location. Attempting to update default Update.exe at: {:?}",
+                    default_update_exe
+                );
+                match std::fs::copy(&current_update_exe, &default_update_exe) {
+                    Ok(_) => info!("Successfully updated default Update.exe"),
+                    Err(e) => warn!("Failed to update default Update.exe: {} (non-fatal)", e),
+                }
+            }
+            (_, Err(e)) => {
+                warn!("Failed to compare Update.exe locations: {} (non-fatal)", e);
+            }
+        }
+
+        // Sync stub executable(s) to root directory.
+        let _ = bundle.extract_stubs_to_dir(&root_path);
+
         Ok(())
     })();
 

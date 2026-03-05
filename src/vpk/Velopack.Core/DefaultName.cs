@@ -1,6 +1,4 @@
-﻿using NuGet.Versioning;
-
-namespace Velopack.Core;
+﻿namespace Velopack.Core;
 
 public static class DefaultName
 {
@@ -41,11 +39,20 @@ public static class DefaultName
     }
 
 
-    public static string GetSuggestedMsiName(string id, string channel, RuntimeOs os)
+    public static string GetSuggestedMsiDeploymentToolName(string id, string channel, RuntimeOs os)
     {
         var suffix = GetUniqueAssetSuffix(channel);
         if (os == RuntimeOs.Windows)
             return $"{id}{suffix}-DeploymentTool.msi";
+        else
+            throw new PlatformNotSupportedException("Platform not supported.");
+    }
+
+    public static string GetSuggestedMsiName(string id, string channel, RuntimeOs os)
+    {
+        var suffix = GetUniqueAssetSuffix(channel);
+        if (os == RuntimeOs.Windows)
+            return $"{id}{suffix}.msi";
         else
             throw new PlatformNotSupportedException("Platform not supported.");
     }

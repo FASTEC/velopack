@@ -1,7 +1,7 @@
 use crate::shared::{self, OperationWait};
-use velopack::{locator, locator::VelopackLocator, constants};
 use anyhow::{bail, Result};
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
+use velopack::{constants, locator, locator::VelopackLocator};
 
 #[cfg(target_os = "linux")]
 use super::apply_linux_impl::apply_package_impl;
@@ -10,13 +10,24 @@ use super::apply_osx_impl::apply_package_impl;
 #[cfg(target_os = "windows")]
 use super::apply_windows_impl::apply_package_impl;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HookRunMode {
+    /// Do not run any hooks.
+    None,
+    /// Run all hooks (pre and post).
+    All,
+    /// Only run post-apply hooks (e.g. --veloapp-updated). Used during legacy migration
+    /// where the obsolete hook is irrelevant but the app needs to know it was updated.
+    PostOnly,
+}
+
 pub fn apply<'a>(
     locator: &VelopackLocator,
     restart: bool,
     wait: OperationWait,
     package: Option<&PathBuf>,
-    exe_args: Option<Vec<&str>>,
-    run_hooks: bool,
+    exe_args: Option<Vec<OsString>>,
+    hook_mode: HookRunMode,
 ) -> Result<VelopackLocator> {
     shared::operation_wait(wait);
 
@@ -25,13 +36,18 @@ pub fn apply<'a>(
 
     match package {
         Some(package) => {
-            info!("Getting ready to apply package to {} ver {}: {}", 
-                locator.get_manifest_id(), 
-                locator.get_manifest_version_full_string(), 
-                package.to_string_lossy());
-            match apply_package_impl(&locator, &package, run_hooks) {
+            info!(
+                "Getting ready to apply package to {} ver {}: {:?}",
+                locator.get_manifest_id(),
+                locator.get_manifest_version_full_string(),
+                package
+            );
+            match apply_package_impl(&locator, &package, hook_mode) {
                 Ok(applied_locator) => {
-                    info!("Package version {} applied successfully.", applied_locator.get_manifest_version_full_string());
+                    info!(
+                        "Package version {} applied successfully.",
+                        applied_locator.get_manifest_version_full_string()
+                    );
                     // if successful, we want to restart the new version of the app, which could have different metadata
                     if restart {
                         shared::start_package(&applied_locator, exe_args, Some(constants::HOOK_ENV_RESTART))?;

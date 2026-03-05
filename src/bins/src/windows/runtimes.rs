@@ -4,7 +4,7 @@ use regex::Regex;
 use std::process::Command as Process;
 use std::{collections::HashMap, fs, path::Path};
 use velopack::download;
-use winsafe::{self as w, co, prelude::*};
+use winreg::{enums::*, RegKey};
 
 const REDIST_2015_2022_X86: &str = "https://aka.ms/vs/17/release/vc_redist.x86.exe";
 const REDIST_2015_2022_X64: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
@@ -67,7 +67,7 @@ pub enum RuntimeInstallResult {
     RestartRequired,
 }
 
-fn def_installer_routine(installer_path: &str, quiet: bool) -> Result<RuntimeInstallResult> {
+fn def_installer_routine(installer_path: &Path, quiet: bool) -> Result<RuntimeInstallResult> {
     let mut args = Vec::new();
     args.push("/norestart");
     if quiet {
@@ -77,7 +77,7 @@ fn def_installer_routine(installer_path: &str, quiet: bool) -> Result<RuntimeIns
         args.push("/showrmui");
     }
 
-    info!("Running installer: '{}', args={:?}", installer_path, args);
+    info!("Running installer: '{:?}', args={:?}", installer_path, args);
     let mut cmd = Process::new(installer_path).args(&args).spawn()?;
     let result: i32 = cmd.wait()?.code().ok_or_else(|| anyhow!("Unable to get installer exit code."))?;
 
@@ -99,7 +99,7 @@ pub trait RuntimeInfo {
     fn display_name(&self) -> &str;
     fn is_installed(&self) -> bool;
     fn get_download_url(&self) -> Result<String>;
-    fn install(&self, installer_path: &str, quiet: bool) -> Result<RuntimeInstallResult>;
+    fn install(&self, installer_path: &Path, quiet: bool) -> Result<RuntimeInstallResult>;
 }
 
 #[derive(Clone, Debug)]
@@ -111,7 +111,11 @@ pub struct FullFrameworkInfo {
 
 impl FullFrameworkInfo {
     pub fn new(display_name: &str, download_url: &str, release_version: u32) -> Self {
-        FullFrameworkInfo { display_name: display_name.to_string(), download_url: download_url.to_string(), release_version }
+        FullFrameworkInfo {
+            display_name: display_name.to_string(),
+            download_url: download_url.to_string(),
+            release_version,
+        }
     }
 }
 
@@ -129,24 +133,21 @@ impl RuntimeInfo for FullFrameworkInfo {
     }
 
     fn is_installed(&self) -> bool {
-        let lm = w::HKEY::LOCAL_MACHINE;
-        let key = lm.RegOpenKeyEx(Some(NDP_REG_KEY), co::REG_OPTION::NoValue, co::KEY::READ);
-        if key.is_err() {
-            // key doesn't exist, so .net framework not installed
-            return false;
-        }
-        let release = key.unwrap().RegGetValue(None, Some("Release"));
-        if release.is_err() {
-            // key doesn't exist, so .net framework not installed
-            return false;
-        }
-        match release.unwrap() {
-            w::RegistryValue::Dword(v) => return v >= self.release_version,
-            _ => return false,
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        match hklm.open_subkey(NDP_REG_KEY) {
+            Ok(ndp) => {
+                let dword_val: std::io::Result<u32> = ndp.get_value("Release");
+                if let Ok(rel) = dword_val {
+                    rel >= self.release_version
+                } else {
+                    false // key doesn't exist, so .net framework not installed
+                }
+            }
+            Err(_) => false, // key doesn't exist, so .net framework not installed
         }
     }
 
-    fn install(&self, installer_path: &str, quiet: bool) -> Result<RuntimeInstallResult> {
+    fn install(&self, installer_path: &Path, quiet: bool) -> Result<RuntimeInstallResult> {
         def_installer_routine(installer_path, quiet)
     }
 }
@@ -186,8 +187,8 @@ impl RuntimeInfo for VCRedistInfo {
 
     fn is_installed(&self) -> bool {
         let mut installed_programs = HashMap::new();
-        get_installed_programs(&mut installed_programs, co::KEY::READ | co::KEY::WOW64_32KEY);
-        get_installed_programs(&mut installed_programs, co::KEY::READ | co::KEY::WOW64_64KEY);
+        get_installed_programs(&mut installed_programs, KEY_READ | KEY_WOW64_32KEY);
+        get_installed_programs(&mut installed_programs, KEY_READ | KEY_WOW64_64KEY);
         let (my_major, my_minor, my_build, _) = util::parse_version(&self.min_version).unwrap();
         let reg = Regex::new(r"(?i)Microsoft Visual C\+\+(.*)Redistributable").unwrap();
         for (k, v) in installed_programs {
@@ -207,31 +208,27 @@ impl RuntimeInfo for VCRedistInfo {
         false
     }
 
-    fn install(&self, installer_path: &str, quiet: bool) -> Result<RuntimeInstallResult> {
+    fn install(&self, installer_path: &Path, quiet: bool) -> Result<RuntimeInstallResult> {
         def_installer_routine(installer_path, quiet)
     }
 }
 
-fn get_installed_programs(map: &mut HashMap<String, String>, access_rights: co::KEY) {
-    let key = w::HKEY::LOCAL_MACHINE.RegOpenKeyEx(Some(UNINSTALL_REG_KEY), co::REG_OPTION::NoValue, access_rights);
+fn get_installed_programs(map: &mut HashMap<String, String>, access_rights: u32) {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let key = hklm.open_subkey_with_flags(UNINSTALL_REG_KEY, access_rights);
+
     if let Ok(view) = key {
-        if let Ok(iter) = view.RegEnumKeyEx() {
-            for key_result in iter {
-                if let Ok(key_name) = key_result {
-                    let subkey = view.RegOpenKeyEx(Some(&key_name), co::REG_OPTION::NoValue, access_rights);
-                    if subkey.is_err() {
-                        continue;
-                    }
-                    let subkey = subkey.unwrap();
-                    let name = subkey.RegQueryValueEx(Some("DisplayName"));
-                    let version = subkey.RegQueryValueEx(Some("DisplayVersion"));
-                    if name.is_ok() && version.is_ok() {
-                        if let w::RegistryValue::Sz(display_name) = name.unwrap() {
-                            if let w::RegistryValue::Sz(display_version) = version.unwrap() {
-                                map.insert(display_name, display_version);
-                            }
-                        }
-                    }
+        for key_result in view.enum_keys() {
+            if let Ok(key_name) = key_result {
+                let subkey = view.open_subkey_with_flags(key_name, access_rights);
+                if subkey.is_err() {
+                    continue;
+                }
+                let subkey = subkey.unwrap();
+                let name: std::io::Result<String> = subkey.get_value("DisplayName");
+                let version: std::io::Result<String> = subkey.get_value("DisplayVersion");
+                if name.is_ok() && version.is_ok() {
+                    map.insert(name.unwrap(), version.unwrap());
                 }
             }
         }
@@ -241,7 +238,7 @@ fn get_installed_programs(map: &mut HashMap<String, String>, access_rights: co::
 #[test]
 fn test_get_installed_programs_returns_visual_studio() {
     let mut map = HashMap::new();
-    get_installed_programs(&mut map, co::KEY::READ | co::KEY::WOW64_64KEY);
+    get_installed_programs(&mut map, KEY_READ | KEY_WOW64_64KEY);
     assert!(map.contains_key("Microsoft Visual Studio Installer"));
 }
 
@@ -428,13 +425,22 @@ impl RuntimeInfo for DotnetInfo {
 
         let download_url = match self.runtime_type {
             DotnetRuntimeType::Runtime => {
-                format!("{}/Runtime/{}/dotnet-runtime-{}-win-{}.exe", DOTNET_CDN_FEED, version, version, cpu_arch_str)
+                format!(
+                    "{}/Runtime/{}/dotnet-runtime-{}-win-{}.exe",
+                    DOTNET_CDN_FEED, version, version, cpu_arch_str
+                )
             }
             DotnetRuntimeType::AspNetCore => {
-                format!("{}/aspnetcore/Runtime/{}/aspnetcore-runtime-{}-win-{}.exe", DOTNET_CDN_FEED, version, version, cpu_arch_str)
+                format!(
+                    "{}/aspnetcore/Runtime/{}/aspnetcore-runtime-{}-win-{}.exe",
+                    DOTNET_CDN_FEED, version, version, cpu_arch_str
+                )
             }
             DotnetRuntimeType::WindowsDesktop => {
-                format!("{}/WindowsDesktop/{}/windowsdesktop-runtime-{}-win-{}.exe", DOTNET_CDN_FEED, version, version, cpu_arch_str)
+                format!(
+                    "{}/WindowsDesktop/{}/windowsdesktop-runtime-{}-win-{}.exe",
+                    DOTNET_CDN_FEED, version, version, cpu_arch_str
+                )
             }
             DotnetRuntimeType::Sdk => {
                 format!("{}/Sdk/{}/dotnet-sdk-{}-win-{}.exe", DOTNET_CDN_FEED, version, version, cpu_arch_str)
@@ -467,7 +473,7 @@ impl RuntimeInfo for DotnetInfo {
         false
     }
 
-    fn install(&self, installer_path: &str, quiet: bool) -> Result<RuntimeInstallResult> {
+    fn install(&self, installer_path: &Path, quiet: bool) -> Result<RuntimeInstallResult> {
         def_installer_routine(installer_path, quiet)
     }
 }
@@ -503,14 +509,20 @@ fn test_dotnet_detects_installed_versions() {
 }
 
 lazy_static! {
-    static ref REGEX_DOTNET: Regex =
-        Regex::new(r"^net(?:coreapp)?(?<version>(?P<major>\d+)(\.(?P<minor>\d+))?(\.(?P<build>\d+))?)(?:-(?<arch>[a-zA-Z]+\d\d))?(?:-(?<type>[a-zA-Z]+))?$")
-            .unwrap();
+    static ref REGEX_DOTNET: Regex = Regex::new(
+        r"^net(?:coreapp)?(?<version>(?P<major>\d+)(\.(?P<minor>\d+))?(\.(?P<build>\d+))?)(?:-(?<arch>[a-zA-Z]+\d\d))?(?:-(?<type>[a-zA-Z]+))?$"
+    )
+    .unwrap();
 }
 
 fn parse_dotnet_version(version: &str) -> Result<DotnetInfo> {
-    let caps = REGEX_DOTNET.captures(version).ok_or_else(|| anyhow!("Invalid dotnet version string: '{}'", version))?;
-    let version_str = caps.name("version").ok_or_else(|| anyhow!("Invalid dotnet version string: '{}'", version))?.as_str();
+    let caps = REGEX_DOTNET
+        .captures(version)
+        .ok_or_else(|| anyhow!("Invalid dotnet version string: '{}'", version))?;
+    let version_str = caps
+        .name("version")
+        .ok_or_else(|| anyhow!("Invalid dotnet version string: '{}'", version))?
+        .as_str();
     let architecture_str = caps.name("arch").map(|m| m.as_str()).unwrap_or("x64");
     let runtime_type_str = caps.name("type").map(|m| m.as_str()).unwrap_or("desktop");
 
@@ -523,11 +535,15 @@ fn parse_dotnet_version(version: &str) -> Result<DotnetInfo> {
     }
 
     let architecture = RuntimeArch::from_str(architecture_str).ok_or_else(|| anyhow!("Invalid dotnet version string: '{}'", version))?;
-    let runtime_type =
-        DotnetRuntimeType::from_str(runtime_type_str).ok_or_else(|| anyhow!("Invalid dotnet version string: '{}'", version))?;
+    let runtime_type = DotnetRuntimeType::from_str(runtime_type_str).ok_or_else(|| anyhow!("Invalid dotnet version string: '{}'", version))?;
     let version_str = format!("{}.{}.{}", major, minor, build);
     let display_name = format!(".NET {} {:?} {:?}", version_str, architecture, runtime_type);
-    Ok(DotnetInfo { display_name, version: version_str, architecture, runtime_type })
+    Ok(DotnetInfo {
+        display_name,
+        version: version_str,
+        architecture,
+        runtime_type,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -556,10 +572,14 @@ impl RuntimeInfo for WebView2Info {
         }
     }
 
-    fn install(&self, installer_path: &str, quiet: bool) -> Result<RuntimeInstallResult> {
-        let args = if quiet { vec!["/silent", "/install"] } else { vec!["/install"] };
+    fn install(&self, installer_path: &Path, quiet: bool) -> Result<RuntimeInstallResult> {
+        let args = if quiet {
+            vec!["/silent", "/install"]
+        } else {
+            vec!["/install"]
+        };
 
-        info!("Running installer: '{}', args={:?}", installer_path, args);
+        info!("Running installer: '{:?}', args={:?}", installer_path, args);
         let mut cmd = Process::new(installer_path).args(&args).spawn()?;
         let result: i32 = cmd.wait()?.code().ok_or_else(|| anyhow!("Unable to get installer exit code."))?;
 

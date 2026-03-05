@@ -7,6 +7,7 @@ extern crate log;
 use anyhow::{bail, Result};
 use clap::{arg, value_parser, Command};
 use memmap2::Mmap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::{env, path::PathBuf};
 use velopack_bins::*;
@@ -54,6 +55,7 @@ pub fn header_offset_and_length() -> (i64, i64) {
 
 fn main() -> Result<()> {
     windows::mitigate::pre_main_sideload_mitigation();
+    windows::splash::init_dpi_awareness();
     shared::cli_host::clap_run_main("Setup", main_inner)
 }
 
@@ -68,8 +70,11 @@ fn main_inner() -> Result<()> {
         .arg(arg!([EXE_ARGS] "Arguments to pass to the started executable. Must be preceded by '--'.").required(false).last(true).num_args(0..));
 
     if cfg!(debug_assertions) {
-        arg_config = arg_config
-            .arg(arg!(-d --debug <FILE> "Debug mode, install from a nupkg file").required(false).value_parser(value_parser!(PathBuf)));
+        arg_config = arg_config.arg(
+            arg!(-d --debug <FILE> "Debug mode, install from a nupkg file")
+                .required(false)
+                .value_parser(value_parser!(PathBuf)),
+        );
     }
 
     let matches = arg_config.try_get_matches()?;
@@ -79,17 +84,20 @@ fn main_inner() -> Result<()> {
 
     let verbose = matches.get_flag("verbose");
     let logfile = matches.get_one::<PathBuf>("log");
-    velopack::logging::init_logging("setup", logfile, true, verbose, None);
+    let desired_log_file = logfile
+        .cloned()
+        .unwrap_or(velopack::logging::default_logfile_path(velopack::logging::NoLocator));
+    velopack::logging::init_logging("setup", Some(&desired_log_file), true, verbose, None);
 
     let debug = matches.get_one::<PathBuf>("debug");
     let install_to = matches.get_one::<PathBuf>("installto");
-    let exe_args: Option<Vec<&str>> = matches.get_many::<String>("EXE_ARGS").map(|v| v.map(|f| f.as_str()).collect());
+    let exe_args = matches.get_many::<OsString>("EXE_ARGS").map(|v| v.map(|f| f.to_os_string()).collect());
 
     info!("Starting Velopack Setup ({})", env!("NGBV_VERSION"));
     info!("    Location: {:?}", env::current_exe()?);
     info!("    Silent: {}", silent);
     info!("    Verbose: {}", verbose);
-    info!("    Log: {:?}", logfile);
+    info!("    Log: {:?}", desired_log_file);
     info!("    Install To: {:?}", install_to);
     if cfg!(debug_assertions) {
         info!("    Debug: {:?}", debug);

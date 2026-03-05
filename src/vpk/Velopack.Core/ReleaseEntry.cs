@@ -10,7 +10,6 @@ using System.Runtime.Serialization;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using NuGet.Versioning;
 using Velopack.Util;
 
 namespace Velopack.Core
@@ -79,7 +78,7 @@ namespace Velopack.Core
 
 
 
-            var semVer = NuGetVersion.Parse(version);
+            var semVer = SemanticVersion.Parse(version);
             return new ReleaseEntryName(name, semVer, delta);
         }
 
@@ -136,7 +135,7 @@ namespace Velopack.Core
         public string EntryAsString {
             get {
                 if (StagingPercentage != null) {
-                    return String.Format("{0} {1}{2} {3} # {4}", SHA1, BaseUrl, OriginalFilename, Filesize, stagingPercentageAsString(StagingPercentage.Value));
+                    return String.Format("{0} {1}{2} {3} # {4}", SHA1, BaseUrl, OriginalFilename, Filesize, StagingPercentageAsString(StagingPercentage.Value));
                 } else {
                     return String.Format("{0} {1}{2} {3}", SHA1, BaseUrl, OriginalFilename, Filesize);
                 }
@@ -351,7 +350,7 @@ namespace Velopack.Core
             Contract.Requires(file != null && file.CanRead);
             Contract.Requires(!String.IsNullOrEmpty(filename));
 
-            var hash = IoUtil.CalculateStreamSHA1(file);
+            var hash = CalculateStreamSHA1(file);
             return new ReleaseEntry(hash, filename, file.Length, baseUrl);
         }
 
@@ -378,9 +377,8 @@ namespace Velopack.Core
             // Generate release entries for all of the local packages
             var entriesQueue = new ConcurrentQueue<ReleaseEntry>();
             Parallel.ForEach(packagesDir.GetFiles("*.nupkg"), x => {
-                using (var file = x.OpenRead()) {
-                    entriesQueue.Enqueue(GenerateFromFile(file, x.Name));
-                }
+                using var file = x.OpenRead();
+                entriesQueue.Enqueue(GenerateFromFile(file, x.Name));
             });
 
             // Write the new RELEASES file to a temp file then move it into
@@ -403,7 +401,14 @@ namespace Velopack.Core
             return entries;
         }
 
-        static string stagingPercentageAsString(float percentage)
+        private static string CalculateStreamSHA1(Stream file)
+        {
+            using (var sha1 = System.Security.Cryptography.SHA1.Create()) {
+                return BitConverter.ToString(sha1.ComputeHash(file)).Replace("-", String.Empty);
+            }
+        }
+
+        private static string StagingPercentageAsString(float percentage)
         {
             return String.Format("{0:F0}%", percentage * 100.0);
         }

@@ -1,7 +1,7 @@
 #ifndef VELOPACK_H
 #define VELOPACK_H
 
-/* Generated with cbindgen:0.29.0 */
+/* Generated with cbindgen:0.29.2 */
 
 /* THIS FILE IS AUTO-GENERATED - DO NOT EDIT */
 
@@ -107,7 +107,7 @@ typedef struct vpkc_update_options_t {
    */
   bool AllowVersionDowngrade;
   /**
-   * **This option should usually be left None/NULL**.
+   * **This option should usually be left None**.
    * Overrides the default channel used to fetch updates.
    * The default channel will be whatever channel was specified on the command line when building this release.
    * For example, if the current release was packaged with '--channel beta', then the default channel will be 'beta'.

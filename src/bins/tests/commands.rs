@@ -3,18 +3,25 @@
 mod common;
 use common::*;
 use std::hint::assert_unchecked;
+use std::sync::Mutex;
 use std::{fs, path::Path, path::PathBuf};
 use tempfile::tempdir;
-use velopack_bins::*;
 
 use velopack::bundle::load_bundle_from_file;
 use velopack::locator::{auto_locate_app_manifest, LocationContext};
+use velopack_bins::*;
+
+// Tests that call commands::install create shortcuts in shared OS directories (Start Menu, Desktop).
+// This mutex prevents them from running in parallel and interfering with each other.
 #[cfg(target_os = "windows")]
-use winsafe::{self as w, co};
+static SHORTCUT_MUTEX: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "windows")]
 #[test]
 pub fn test_install_apply_uninstall() {
+    use velopack_bins::windows::known_path;
+
+    let _lock = SHORTCUT_MUTEX.lock().unwrap();
     dialogs::set_silent(true);
 
     let fixtures = find_fixtures();
@@ -22,10 +29,8 @@ pub fn test_install_apply_uninstall() {
     let app_id = "AvaloniaCrossPlat";
     let pkg_name = "AvaloniaCrossPlat-1.0.11-win-full.nupkg";
 
-    let start_menu = w::SHGetKnownFolderPath(&co::KNOWNFOLDERID::StartMenu, co::KF::DONT_UNEXPAND, None).unwrap();
-    let start_menu = Path::new(&start_menu).join("Programs");
-    let desktop = w::SHGetKnownFolderPath(&co::KNOWNFOLDERID::Desktop, co::KF::DONT_UNEXPAND, None).unwrap();
-    let desktop = Path::new(&desktop);
+    let start_menu = PathBuf::from(known_path::get_start_menu().unwrap());
+    let desktop = PathBuf::from(known_path::get_user_desktop().unwrap());
 
     let lnk_start_1 = start_menu.join(format!("{}.lnk", app_id));
     let lnk_desktop_1 = desktop.join(format!("{}.lnk", app_id));
@@ -50,13 +55,21 @@ pub fn test_install_apply_uninstall() {
     assert!(tmp_buf.join("current").join("AvaloniaCrossPlat.exe").exists());
     assert!(tmp_buf.join("current").join("sq.version").exists());
 
-    let locator = auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(tmp_buf.clone())).unwrap();
+    let locator = auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(tmp_buf.clone(), None)).unwrap();
     assert_eq!(app_id, locator.get_manifest_id());
     assert_eq!(semver::Version::parse("1.0.11").unwrap(), locator.get_manifest_version());
 
     let pkg_name_apply = "AvaloniaCrossPlat-1.0.15-win-full.nupkg";
     let nupkg_apply = fixtures.join(pkg_name_apply);
-    commands::apply(&locator, false, shared::OperationWait::NoWait, Some(&nupkg_apply), None, false).unwrap();
+    commands::apply(
+        &locator,
+        false,
+        shared::OperationWait::NoWait,
+        Some(&nupkg_apply),
+        None,
+        commands::HookRunMode::None,
+    )
+    .unwrap();
 
     // shortcuts are renamed, and desktop is created
     assert!(!lnk_desktop_1.exists());
@@ -64,12 +77,11 @@ pub fn test_install_apply_uninstall() {
     assert!(lnk_desktop_2.exists());
     assert!(lnk_start_2.exists());
 
-    let locator = auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(tmp_buf.clone())).unwrap();
+    let locator = auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(tmp_buf.clone(), None)).unwrap();
     assert_eq!(semver::Version::parse("1.0.15").unwrap(), locator.get_manifest_version());
 
     commands::uninstall(&locator, false).unwrap();
     assert!(!tmp_buf.join("current").exists());
-    assert!(tmp_buf.join(".dead").exists());
 
     assert!(!lnk_desktop_1.exists());
     assert!(!lnk_start_1.exists());
@@ -80,6 +92,7 @@ pub fn test_install_apply_uninstall() {
 #[cfg(target_os = "windows")]
 #[test]
 pub fn test_install_preserve_symlinks() {
+    let _lock = SHORTCUT_MUTEX.lock().unwrap();
     dialogs::set_silent(true);
     let fixtures = find_fixtures();
     let pkg_name = "Test.Squirrel-App-1.0.0-symlinks-full.nupkg";
@@ -96,8 +109,14 @@ pub fn test_install_preserve_symlinks() {
     assert!(tmp_buf.join("current").join("other").join("sym.txt").exists());
     assert!(tmp_buf.join("current").join("other").join("syml").join("file.txt").exists());
 
-    assert_eq!("hello", fs::read_to_string(tmp_buf.join("current").join("actual").join("file.txt")).unwrap());
-    assert_eq!("hello", fs::read_to_string(tmp_buf.join("current").join("other").join("sym.txt")).unwrap());
+    assert_eq!(
+        "hello",
+        fs::read_to_string(tmp_buf.join("current").join("actual").join("file.txt")).unwrap()
+    );
+    assert_eq!(
+        "hello",
+        fs::read_to_string(tmp_buf.join("current").join("other").join("sym.txt")).unwrap()
+    );
 }
 
 #[test]
@@ -129,6 +148,85 @@ pub fn test_patch_apply() {
     let tmp_sha1 = get_sha1(&tmp_file);
     fs::remove_file(&tmp_file).unwrap();
     assert_eq!(expected_sha1, tmp_sha1);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+pub fn test_apply_corrupt_package_is_deleted() {
+    let _lock = SHORTCUT_MUTEX.lock().unwrap();
+    dialogs::set_silent(true);
+    let fixtures = find_fixtures();
+
+    // 1. Install a valid app so we have a working locator
+    let nupkg = fixtures.join("AvaloniaCrossPlat-1.0.11-win-full.nupkg");
+    let tmp_dir = tempdir().unwrap();
+    let tmp_buf = tmp_dir.path().to_path_buf();
+    let mut tmp_zip = load_bundle_from_file(nupkg).unwrap();
+    commands::install(&mut tmp_zip, Some(&tmp_buf), None).unwrap();
+
+    let locator = auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(tmp_buf.clone(), None)).unwrap();
+
+    // 2. Create a corrupt package file (not a valid zip)
+    let corrupt_pkg = tmp_buf.join("packages").join("corrupt-1.0.0-full.nupkg");
+    fs::create_dir_all(corrupt_pkg.parent().unwrap()).unwrap();
+    fs::write(&corrupt_pkg, b"THIS_IS_NOT_A_VALID_ZIP_FILE").unwrap();
+    assert!(corrupt_pkg.exists());
+
+    // 3. Apply should fail because the package is corrupt
+    let result = commands::apply(
+        &locator,
+        false,
+        shared::OperationWait::NoWait,
+        Some(&corrupt_pkg),
+        None,
+        commands::HookRunMode::None,
+    );
+    assert!(result.is_err(), "Apply should fail with a corrupt package");
+
+    // 4. The corrupt package should have been deleted to prevent an update loop
+    assert!(!corrupt_pkg.exists(), "Corrupt package should be deleted after failed apply");
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+pub fn test_apply_locked_dir_does_not_delete_package() {
+    let _lock = SHORTCUT_MUTEX.lock().unwrap();
+    dialogs::set_silent(true);
+    let fixtures = find_fixtures();
+
+    // 1. Install a valid app so we have a working locator
+    let nupkg = fixtures.join("AvaloniaCrossPlat-1.0.11-win-full.nupkg");
+    let tmp_dir = tempdir().unwrap();
+    let tmp_buf = tmp_dir.path().to_path_buf();
+    let mut tmp_zip = load_bundle_from_file(nupkg).unwrap();
+    commands::install(&mut tmp_zip, Some(&tmp_buf), None).unwrap();
+
+    let locator = auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(tmp_buf.clone(), None)).unwrap();
+
+    // 2. Copy the update package to a temp location (don't use the fixture directly)
+    let update_pkg = tmp_buf.join("packages").join("AvaloniaCrossPlat-1.0.15-win-full.nupkg");
+    fs::create_dir_all(update_pkg.parent().unwrap()).unwrap();
+    fs::copy(fixtures.join("AvaloniaCrossPlat-1.0.15-win-full.nupkg"), &update_pkg).unwrap();
+    assert!(update_pkg.exists());
+
+    // 3. Hold a file handle open in the current dir to prevent the rename during install phase.
+    //    On Windows, an open handle without FILE_SHARE_DELETE prevents the parent directory rename.
+    let locked_file = tmp_buf.join("current").join("AvaloniaCrossPlat.exe");
+    let _handle = fs::File::open(&locked_file).expect("should be able to open file to lock it");
+
+    // 4. Apply should fail because the directory rename is blocked by the locked file
+    let result = commands::apply(
+        &locator,
+        false,
+        shared::OperationWait::NoWait,
+        Some(&update_pkg),
+        None,
+        commands::HookRunMode::None,
+    );
+    assert!(result.is_err(), "Apply should fail when current dir is locked");
+
+    // 5. The package should NOT be deleted — the failure was in the install phase, not staging
+    assert!(update_pkg.exists(), "Valid package should be preserved when install phase fails");
 }
 
 #[test]

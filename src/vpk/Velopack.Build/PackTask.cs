@@ -59,8 +59,14 @@ public class PackTask : MSBuildAsyncTask
     public string? InstReadme { get; set; }
 
     public string? InstLicense { get; set; }
+    public string? InstLicenseRtf { get; set; }
 
     public string? InstConclusion { get; set; }
+
+    public InstallLocation InstLocation { get; set; } = InstallLocation.Either;
+
+    public string? MsiBanner { get; set; }
+    public string? MsiLogo { get; set; }
 
     public string? SignAppIdentity { get; set; }
 
@@ -79,6 +85,8 @@ public class PackTask : MSBuildAsyncTask
     public string? InfoPlistPath { get; set; }
 
     public string? SplashImage { get; set; }
+
+    public string? SplashProgressColor { get; set; }
 
     public bool SkipVelopackAppCheck { get; set; }
 
